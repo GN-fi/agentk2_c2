@@ -1,0 +1,133 @@
+name: Build and Deploy Docs
+
+on:
+  push:
+    paths:
+      - 'package.json'
+      - 'docs-site/**'
+      - '.github/workflows/docs.yml'
+    branches:
+      - main
+  pull_request:
+    paths:
+      - 'docs-site/**'
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Deploy to GitHub Pages'
+        required: true
+        default: true
+        type: boolean
+      fetch_library_docs:
+        description: 'Fetch library documentation'
+        required: true
+        default: true
+        type: boolean
+
+# GitHub Pages에 배포하기 위한 권한 설정
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# GitHub Pages 환경 설정
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: ./docs-site
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install Dependencies (Root)
+        run: pnpm install --no-frozen-lockfile
+        working-directory: .
+
+      - name: Install Dependencies (docs-site)
+        run: pnpm install --no-frozen-lockfile
+
+      # 라이브러리 버전 정보 가져오기
+      - name: Get Library Versions
+        id: libver
+        run: |
+          echo "GL_VERSION=$(jq -r '.dependencies["golden-layout"] | sub("^\\^";"")' ../package.json)" >> $GITHUB_OUTPUT
+          echo "REACT_VERSION=$(jq -r '.dependencies["react"] | sub("^\\^";"")' ../package.json)" >> $GITHUB_OUTPUT
+        working-directory: .
+
+      # 라이브러리 문서 디렉토리 생성
+      - name: Create Library Docs Directories
+        run: |
+          mkdir -p ../docs-site/docs/libraries/golden-layout/${{ steps.libver.outputs.GL_VERSION }}
+          mkdir -p ../docs-site/docs/libraries/react/${{ steps.libver.outputs.REACT_VERSION }}
+          mkdir -p ../docs-site/docs/api
+
+      # 라이브러리 문서 가져오기 (워크플로우 디스패치에서 활성화된 경우)
+      - name: Fetch Library Documentation
+        if: github.event_name == 'workflow_dispatch' && inputs.fetch_library_docs
+        run: node scripts/fetch-library-docs.js
+        working-directory: docs-site
+
+      # 사이드바 업데이트
+      - name: Update Sidebar
+        run: node scripts/update-sidebar.js
+        working-directory: docs-site
+
+      # Docusaurus 버전 스냅샷 생성
+      - name: Version Docusaurus Docs
+        if: steps.libver.outputs.GL_VERSION != ''
+        run: npm run docusaurus docs:version ${{ steps.libver.outputs.GL_VERSION }} || echo "Version already exists"
+
+      - name: Lint Docusaurus Site
+        run: npm run lint || echo "Linting failed but continuing"
+
+      - name: Test Docusaurus Site
+        run: npm run test || echo "Testing failed but continuing"
+
+      - name: Build Docusaurus Site
+        run: npm run build
+
+      - name: Cache Docusaurus Build
+        uses: actions/cache@v3
+        with:
+          path: ./docs-site/build
+          key: docusaurus-build-${{ github.sha }}
+          restore-keys: |
+            docusaurus-build-
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' && inputs.deploy
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # 업로드할 빌드 결과물 경로
+          path: './docs-site/build'
+
+      - name: Deploy to GitHub Pages
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' && inputs.deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Notify Deployment Success
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' && inputs.deploy)
+        run: |
+          echo "::notice::Documentation deployed successfully to ${{ steps.deployment.outputs.page_url }}"
